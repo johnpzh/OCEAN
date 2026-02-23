@@ -11,9 +11,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_OFF
 #include "cxlendpoint.h"
 #include "helper.h"
-#ifndef SERVER_MODE
 #include "monitor.h"
-#endif
 #include "policy.h"
 #include <cerrno>
 #include <cmath>
@@ -29,9 +27,7 @@
 #include <unistd.h>
 Helper helper{};
 CXLController *controller;
-#ifndef SERVER_MODE
 Monitors *monitors;
-#endif
 auto cha_mapping = std::vector{0, 1, 2, 3, 4, 5, 6, 7, 8};
 int main(int argc, char *argv[]) {
     spdlog::cfg::load_env_levels();
@@ -180,13 +176,13 @@ int main(int argc, char *argv[]) {
     auto ncpu = helper.num_of_cpu();
     auto ncha = helper.num_of_cha();
     SPDLOG_DEBUG("tnum:{}", tnum);
-    for (auto const &[idx, value] : weight | std::views::enumerate) {
-        SPDLOG_DEBUG("weight[{}]:{}", weight_vec[idx], value);
+    for (size_t idx = 0; idx < weight.size(); idx++) {
+        SPDLOG_DEBUG("weight[{}]:{}", weight_vec[idx], weight[idx]);
     }
 
-    for (auto const &[idx, value] : capacity | std::views::enumerate) {
+    for (size_t idx = 0; idx < capacity.size(); idx++) {
         if (idx == 0) {
-            SPDLOG_DEBUG("local_memory_region capacity:{}", value);
+            SPDLOG_DEBUG("local_memory_region capacity:{}", capacity[idx]);
             controller = new CXLController({policy1, policy2, policy3, policy4}, capacity[0], mode, 100, dramlatency);
         } else {
             SPDLOG_DEBUG("memory_region:{}", (idx - 1) + 1);
@@ -209,9 +205,7 @@ int main(int argc, char *argv[]) {
         helper.used_cpu.push_back(cpuset[j]);
         helper.used_cha.push_back(cpuset[j]);
     }
-#ifndef SERVER_MODE
     monitors = new Monitors{tnum, &use_cpuset};
-#endif
 
     /** Reinterpret the input for the argv argc */
     char cmd_buf[1024] = {0};
@@ -240,7 +234,6 @@ int main(int argc, char *argv[]) {
     if (t_process == 0) {
         sleep(1);
         std::vector<const char *> envp;
-        envp.emplace_back("LD_PRELOAD=/root/.bpftime/libbpftime-agent.so");
         envp.emplace_back("OMP_NUM_THREADS=4");
         while (!env.empty()) {
             envp.emplace_back(env.back().c_str());
@@ -284,10 +277,10 @@ int main(int argc, char *argv[]) {
 
     /* read CHA params */
     for (const auto &mon : monitors->mon) {
-        for (auto const &[idx, value] : pmu.chas | std::views::enumerate) {
+        for (size_t idx = 0; idx < pmu.chas.size(); idx++) {
             pmu.chas[idx].read_cha_elems(&mon.before->chas[idx]);
         }
-        for (auto const &[idx, value] : pmu.cpus | std::views::enumerate) {
+        for (size_t idx = 0; idx < pmu.cpus.size(); idx++) {
             pmu.cpus[idx].read_cpu_elems(&mon.before->cpus[idx]);
         }
     }
@@ -303,7 +296,8 @@ int main(int argc, char *argv[]) {
 
     while (true) {
         uint64_t calibrated_delay;
-        for (auto const &[i, mon] : monitors->mon | std::views::enumerate) {
+        for (size_t i = 0; i < monitors->mon.size(); i++) {
+            const auto &mon = monitors->mon[i];
             // check other process
             auto m_status = mon.status.load();
             if (m_status == MONITOR_DISABLE) {
@@ -319,12 +313,8 @@ int main(int argc, char *argv[]) {
                 uint64_t wb_cnt = 0, target_l2stall = 0, target_llcmiss = 0, target_llchits = 0, target_l2miss = 0,
                          all_llcmiss = 0, all_prefetch = 0;
                 double writeback_latency;
-                /* read BPFTIMERUNTIME sample */
+                /* read PEBS and LBR samples */
                 if (mon.is_process) {
-                    if (mon.bpftime_ctx->read(controller, &mon.after->bpftime) < 0) {
-                        SPDLOG_ERROR("[{}:{}:{}] Warning: Failed BPFTIMERUNTIME read", i, mon.tgid, mon.tid);
-                    }
-
                     /* read PEBS sample */
                     if (mon.pebs_ctx->read(controller, &mon.after->pebs) < 0) {
                         SPDLOG_ERROR("[{}:{}:{}] Warning: Failed PEBS read", i, mon.tgid, mon.tid);
@@ -336,13 +326,13 @@ int main(int argc, char *argv[]) {
                 }
                 target_llcmiss = mon.after->pebs.total - mon.before->pebs.total;
 
-                for (auto const &[idx, value] : pmu.cpus | std::views::enumerate) {
-                    value.read_cpu_elems(&mon.after->cpus[i]);
+                for (size_t idx = 0; idx < pmu.cpus.size(); idx++) {
+                    pmu.cpus[idx].read_cpu_elems(&mon.after->cpus[i]);
                     cpu_vec[idx] = mon.after->cpus[i].cpu[idx] - mon.before->cpus[i].cpu[idx];
                 }
 
-                for (auto const &[idx, value] : pmu.chas | std::views::enumerate) {
-                    value.read_cha_elems(&mon.after->chas[cha_mapping[i]]);
+                for (size_t idx = 0; idx < pmu.chas.size(); idx++) {
+                    pmu.chas[idx].read_cha_elems(&mon.after->chas[cha_mapping[i]]);
                     cha_vec[idx] = mon.after->chas[cha_mapping[i]].cha[idx] - mon.before->chas[cha_mapping[i]].cha[idx];
                 }
                 target_llchits = cpu_vec[0];
@@ -365,7 +355,6 @@ int main(int argc, char *argv[]) {
 
                 mon.before->pebs.total = mon.after->pebs.total;
                 mon.before->lbr.total = mon.after->lbr.total;
-                mon.before->bpftime.total = mon.after->bpftime.total;
 
                 SPDLOG_DEBUG("delay={}", emul_delay);
 

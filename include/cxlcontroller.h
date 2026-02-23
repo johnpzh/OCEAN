@@ -13,7 +13,10 @@
 #define CXLMEMSIM_CXLCONTROLLER_H
 
 #include "cxlendpoint.h"
+#include "hdm_decoder.h"
+#include "coherency_engine.h"
 #include "lbr.h"
+#include <memory>
 #include <queue>
 #include <shared_mutex>
 #include <string_view>
@@ -22,6 +25,7 @@ struct mem_stats;
 struct proc_info;
 struct lbr;
 struct cntr;
+struct TCPCalibrationResult;
 enum page_type { CACHELINE, PAGE, HUGEPAGE_2M, HUGEPAGE_1G };
 
 class Policy {
@@ -242,6 +246,18 @@ public:
     // LRU cache
     LRUCache lru_cache;
 
+    // LogP queuing model for distributed/multi-node latency
+    LogPModel logp_model;
+
+    // MH-SLD device for multi-headed pooling/sharing (legacy, use CoherencyEngine instead)
+    std::unique_ptr<MHSLDDevice> mhsld_device;
+
+    // Distributed topology support
+    uint32_t local_node_id_ = 0;
+    std::unique_ptr<HDMDecoder> hdm_decoder_;
+    std::unique_ptr<CoherencyEngine> coherency_;
+    std::vector<RemoteCXLExpander*> remote_expanders_;
+
     explicit CXLController(std::array<Policy *, 4> p, int capacity, page_type page_type_, int epoch,
                            double dramlatency);
     void construct_topo(std::string_view newick_tree);
@@ -253,17 +269,10 @@ public:
     double calculate_latency(const std::vector<std::tuple<uint64_t, uint64_t>> &elem,
                              double dramlatency) override; // traverse the tree to calculate the latency
     double calculate_bandwidth(const std::vector<std::tuple<uint64_t, uint64_t>> &elem) override;
-#ifndef SERVER_MODE
     void insert_one(thread_info &t_info, lbr &lbr);
     int insert(uint64_t timestamp, uint64_t tid, lbr lbrs[32], cntr counters[32]);
-#endif
     int insert(uint64_t timestamp, uint64_t tid, uint64_t phys_addr, uint64_t virt_addr, int index) override;
     void delete_entry(uint64_t addr, uint64_t length) override;
-#ifndef SERVER_MODE
-    void set_stats(mem_stats stats);
-    void set_process_info(const proc_info &process_info);
-    void set_thread_info(const proc_info &thread_info);
-#endif
     void perform_migration();
     // 添加缓存访问方法
     std::optional<uint64_t> access_cache(uint64_t addr, uint64_t timestamp) { return lru_cache.get(addr, timestamp); }
@@ -273,24 +282,43 @@ public:
     void perform_back_invalidation();
     void invalidate_in_expanders(uint64_t addr);
     void invalidate_in_switch(CXLSwitch *switch_, uint64_t addr);
+
+    // LogP model configuration and access
+    void configure_logp(const LogPConfig& config);
+    void calibrate_logp_from_tcp(const struct TCPCalibrationResult& result);
+    double calculate_logp_latency(uint32_t src_node, uint32_t dst_node, uint64_t timestamp);
+    double calculate_logp_broadcast_latency();
+
+    // MH-SLD pooling/sharing
+    void enable_mhsld(uint32_t num_heads, double bandwidth_gbps);
+    double mhsld_read(uint32_t head_id, uint64_t addr, uint64_t timestamp);
+    double mhsld_write(uint32_t head_id, uint64_t addr, uint64_t timestamp);
+    double mhsld_atomic(uint32_t head_id, uint64_t addr, uint64_t timestamp);
+    MHSLDDevice::Stats get_mhsld_stats() const;
+
+    // Combined latency: local access + LogP network + MH-SLD coherency
+    double calculate_distributed_latency(const std::vector<std::tuple<uint64_t, uint64_t>> &elem,
+                                         uint32_t head_id, uint32_t target_node);
+
+    // Distributed topology configuration
+    void configure_distributed(uint32_t local_node_id, HDMDecoderMode mode);
+    RemoteCXLExpander* add_remote_endpoint(uint32_t remote_node, uint64_t base,
+                                            uint64_t capacity, const FabricLinkConfig& link_cfg);
+    RemoteCXLExpander* get_remote_expander(uint32_t node_id);
 };
 
+// C++20 std::formatter for CXLController
 template <> struct std::formatter<CXLController> {
-    // Parse function to handle any format specifiers (if needed)
     constexpr auto parse(std::format_parse_context &ctx) -> decltype(ctx.begin()) {
-        // If you have specific format specifiers, parse them here
-        // For simplicity, we'll ignore them and return the end iterator
         return ctx.end();
     }
-
-    // Format function to output the Monitors data
 
     template <typename FormatContext>
     auto format(const CXLController &controller, FormatContext &ctx) const -> decltype(ctx.out()) {
         std::string result;
 
         // 首先打印控制器自身的计数器信息
-        result += std::format("CXLController:\n");
+        result += "CXLController:\n";
         // iterate through the topology map
         uint64_t total_capacity = 0;
 
@@ -377,7 +405,7 @@ template <> struct std::formatter<CXLController> {
         result += std::format("  Number of Threads created: {}\n", controller.thread_map.size());
         result += std::format("  Memory Freed: {} bytes\n", controller.freed);
 
-        return format_to(ctx.out(), "{}", result);
+        return std::format_to(ctx.out(), "{}", result);
     }
 };
 
