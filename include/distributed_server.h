@@ -554,6 +554,10 @@ private:
     std::vector<std::thread> client_threads_;
     std::mutex client_threads_mutex_;
 
+    /* Local message ID generator (used when msg_manager_ is null in TCP mode) */
+    std::atomic<uint32_t> next_msg_id_{1};
+    uint32_t generate_msg_id();
+
     /* TCP server for QEMU guests */
     int tcp_server_fd_;
     std::atomic<int> next_client_id_;

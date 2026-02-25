@@ -511,6 +511,11 @@ DistributedMemoryServer::~DistributedMemoryServer() {
     stop();
 }
 
+uint32_t DistributedMemoryServer::generate_msg_id() {
+    if (msg_manager_) return msg_manager_->generate_msg_id();
+    return next_msg_id_++;
+}
+
 bool DistributedMemoryServer::initialize() {
     state_ = NODE_STATE_INITIALIZING;
 
@@ -528,12 +533,14 @@ bool DistributedMemoryServer::initialize() {
 
     auto shm_info = local_memory_->get_shm_info();
 
-    // Initialize message manager
-    msg_manager_ = std::make_unique<DistributedMessageManager>(shm_name_, node_id_);
-    bool is_first_node = (node_id_ == 0);
-    if (!msg_manager_->initialize(is_first_node)) {
-        SPDLOG_ERROR("Failed to initialize message manager");
-        return false;
+    // Initialize message manager (skip SHM in pure TCP mode)
+    if (transport_mode_ != DistTransportMode::TCP) {
+        msg_manager_ = std::make_unique<DistributedMessageManager>(shm_name_, node_id_);
+        bool is_first_node = (node_id_ == 0);
+        if (!msg_manager_->initialize(is_first_node)) {
+            SPDLOG_ERROR("Failed to initialize message manager");
+            return false;
+        }
     }
 
     // Register this node
@@ -545,17 +552,33 @@ bool DistributedMemoryServer::initialize() {
     info.memory_size = shm_info.size;
     info.last_heartbeat = std::chrono::steady_clock::now().time_since_epoch().count();
 
-    if (!msg_manager_->register_node(info)) {
-        SPDLOG_ERROR("Failed to register node");
-        return false;
+    if (msg_manager_) {
+        if (!msg_manager_->register_node(info)) {
+            SPDLOG_ERROR("Failed to register node");
+            return false;
+        }
+    }
+
+    // Always register in local nodes_ map
+    {
+        std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+        nodes_[node_id_] = info;
     }
 
     // Setup message handlers
-    setup_message_handlers();
+    if (msg_manager_) {
+        setup_message_handlers();
+    }
 
     // Configure LogP model on the controller for distributed latency
-    auto active_nodes = msg_manager_->get_active_nodes();
-    uint32_t num_nodes = std::max(static_cast<uint32_t>(active_nodes.size()), 2u);
+    uint32_t num_nodes;
+    if (msg_manager_) {
+        auto active_nodes = msg_manager_->get_active_nodes();
+        num_nodes = std::max(static_cast<uint32_t>(active_nodes.size()), 2u);
+    } else {
+        // In TCP mode, count self + expected peers (calibration refines this later)
+        num_nodes = 2;
+    }
     LogPConfig logp_cfg(
         150.0,   // L: 150ns network latency (typical CXL switch hop)
         20.0,    // o_s: 20ns sender overhead
@@ -607,7 +630,9 @@ bool DistributedMemoryServer::start() {
     running_ = true;
 
     // Start message processing
-    msg_manager_->start_processing();
+    if (msg_manager_) {
+        msg_manager_->start_processing();
+    }
 
     // Start heartbeat thread
     heartbeat_thread_ = std::thread(&DistributedMemoryServer::heartbeat_loop, this);
@@ -667,6 +692,12 @@ void DistributedMemoryServer::stop() {
 }
 
 bool DistributedMemoryServer::join_cluster(const std::string& coordinator_shm) {
+    if (transport_mode_ == DistTransportMode::TCP) {
+        // In TCP mode, cluster joining happens via --tcp-peers connections
+        SPDLOG_INFO("Node {}: TCP mode - cluster join via TCP peers, skipping SHM join", node_id_);
+        return true;
+    }
+
     // For joining an existing cluster
     // Re-initialize message manager with the coordinator's shared memory
     msg_manager_ = std::make_unique<DistributedMessageManager>(coordinator_shm, node_id_);
@@ -692,7 +723,7 @@ bool DistributedMemoryServer::join_cluster(const std::string& coordinator_shm) {
     dist_message_t reg_msg;
     memset(&reg_msg, 0, sizeof(reg_msg));
     reg_msg.header.msg_type = DIST_MSG_NODE_REGISTER;
-    reg_msg.header.msg_id = msg_manager_->generate_msg_id();
+    reg_msg.header.msg_id = generate_msg_id();
     reg_msg.header.src_node_id = node_id_;
     reg_msg.header.dst_node_id = 0; // Coordinator
     reg_msg.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -719,14 +750,16 @@ bool DistributedMemoryServer::leave_cluster() {
     dist_message_t dereg_msg;
     memset(&dereg_msg, 0, sizeof(dereg_msg));
     dereg_msg.header.msg_type = DIST_MSG_NODE_DEREGISTER;
-    dereg_msg.header.msg_id = msg_manager_->generate_msg_id();
+    dereg_msg.header.msg_id = generate_msg_id();
     dereg_msg.header.src_node_id = node_id_;
     dereg_msg.header.dst_node_id = 0xFFFF; // Broadcast
     dereg_msg.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
     dereg_msg.payload.node.node_id = node_id_;
 
-    msg_manager_->broadcast_message(dereg_msg);
-    msg_manager_->deregister_node(node_id_);
+    if (msg_manager_) {
+        msg_manager_->broadcast_message(dereg_msg);
+        msg_manager_->deregister_node(node_id_);
+    }
 
     SPDLOG_INFO("Node {} left cluster", node_id_);
     return true;
@@ -945,7 +978,21 @@ void DistributedMemoryServer::handle_node_message(const dist_message_t& req, dis
 
 void DistributedMemoryServer::heartbeat_loop() {
     while (running_) {
-        msg_manager_->send_heartbeat();
+        if (msg_manager_) {
+            msg_manager_->send_heartbeat();
+        } else if (tcp_transport_) {
+            // In TCP mode, update heartbeat based on TCP connectivity
+            auto connected = tcp_transport_->get_connected_nodes();
+            auto now_ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+            for (auto& [id, info] : nodes_) {
+                if (id == node_id_) continue;
+                bool is_connected = std::find(connected.begin(), connected.end(), id) != connected.end();
+                if (is_connected) {
+                    info.last_heartbeat = now_ts;
+                }
+            }
+        }
 
         // Check for dead nodes
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1044,13 +1091,18 @@ int DistributedMemoryServer::write(uint64_t addr, const void* data, size_t size,
 
 int DistributedMemoryServer::forward_read(uint32_t target_node, uint64_t addr, void* data,
                                           size_t size, uint64_t* latency_ns) {
+    if (!msg_manager_) {
+        SPDLOG_ERROR("forward_read: SHM transport unavailable for node {}", target_node);
+        return -1;
+    }
+
     forwarded_requests_++;
     remote_reads_++;
 
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_READ_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1078,13 +1130,18 @@ int DistributedMemoryServer::forward_read(uint32_t target_node, uint64_t addr, v
 
 int DistributedMemoryServer::forward_write(uint32_t target_node, uint64_t addr, const void* data,
                                            size_t size, uint64_t* latency_ns) {
+    if (!msg_manager_) {
+        SPDLOG_ERROR("forward_write: SHM transport unavailable for node {}", target_node);
+        return -1;
+    }
+
     forwarded_requests_++;
     remote_writes_++;
 
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_WRITE_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1116,7 +1173,7 @@ int DistributedMemoryServer::atomic_faa(uint64_t addr, uint64_t value, uint64_t*
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_ATOMIC_FAA_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1127,7 +1184,16 @@ int DistributedMemoryServer::atomic_faa(uint64_t addr, uint64_t value, uint64_t*
         // Local atomic
         handle_atomic_request(req, resp);
     } else {
-        if (!msg_manager_->send_message_wait_response(target_node, req, resp)) {
+        bool sent = false;
+        if ((transport_mode_ == DistTransportMode::TCP || transport_mode_ == DistTransportMode::HYBRID) &&
+            tcp_transport_ && tcp_transport_->is_connected(target_node)) {
+            sent = tcp_transport_->send_message_wait_response(target_node, req, resp);
+        }
+        if (!sent && msg_manager_) {
+            sent = msg_manager_->send_message_wait_response(target_node, req, resp);
+        }
+        if (!sent) {
+            SPDLOG_ERROR("atomic_faa to node {} failed: no transport available", target_node);
             return -1;
         }
     }
@@ -1147,7 +1213,7 @@ int DistributedMemoryServer::atomic_cas(uint64_t addr, uint64_t expected, uint64
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_ATOMIC_CAS_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1159,7 +1225,16 @@ int DistributedMemoryServer::atomic_cas(uint64_t addr, uint64_t expected, uint64
         // Local atomic
         handle_atomic_request(req, resp);
     } else {
-        if (!msg_manager_->send_message_wait_response(target_node, req, resp)) {
+        bool sent = false;
+        if ((transport_mode_ == DistTransportMode::TCP || transport_mode_ == DistTransportMode::HYBRID) &&
+            tcp_transport_ && tcp_transport_->is_connected(target_node)) {
+            sent = tcp_transport_->send_message_wait_response(target_node, req, resp);
+        }
+        if (!sent && msg_manager_) {
+            sent = msg_manager_->send_message_wait_response(target_node, req, resp);
+        }
+        if (!sent) {
+            SPDLOG_ERROR("atomic_cas to node {} failed: no transport available", target_node);
             return -1;
         }
     }
@@ -1179,11 +1254,19 @@ void DistributedMemoryServer::fence() {
     dist_message_t fence_msg;
     memset(&fence_msg, 0, sizeof(fence_msg));
     fence_msg.header.msg_type = DIST_MSG_FENCE_REQ;
-    fence_msg.header.msg_id = msg_manager_->generate_msg_id();
+    fence_msg.header.msg_id = generate_msg_id();
     fence_msg.header.src_node_id = node_id_;
     fence_msg.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
 
-    msg_manager_->broadcast_message(fence_msg);
+    if (msg_manager_) {
+        msg_manager_->broadcast_message(fence_msg);
+    }
+    if (tcp_transport_) {
+        auto connected = tcp_transport_->get_connected_nodes();
+        for (uint32_t node_id : connected) {
+            tcp_transport_->send_message(node_id, fence_msg);
+        }
+    }
 }
 
 int DistributedMemoryServer::lsa_read(uint64_t offset, void* data, size_t size) {
@@ -1239,7 +1322,10 @@ bool DistributedMemoryServer::add_remote_node(const DistNodeInfo& info) {
 bool DistributedMemoryServer::remove_remote_node(uint32_t node_id) {
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     nodes_.erase(node_id);
-    return msg_manager_->deregister_node(node_id);
+    if (msg_manager_) {
+        return msg_manager_->deregister_node(node_id);
+    }
+    return true;
 }
 
 std::vector<DistNodeInfo> DistributedMemoryServer::get_cluster_nodes() const {
@@ -1286,7 +1372,7 @@ bool DistributedMemoryServer::initialize_tcp_transport() {
     // Register TCP transport and message manager with the CoherencyEngine
     if (controller_->coherency_) {
         controller_->coherency_->set_tcp_transport(tcp_transport_.get());
-        controller_->coherency_->set_msg_manager(msg_manager_.get());
+        controller_->coherency_->set_msg_manager(msg_manager_ ? msg_manager_.get() : nullptr);
         controller_->coherency_->activate_head(node_id_, memory_capacity_mb_ * 1024 * 1024);
     }
 
@@ -1342,7 +1428,7 @@ bool DistributedMemoryServer::connect_tcp_node(uint32_t node_id, const std::stri
     FabricLinkConfig link_cfg{100.0, 25.0, 32};  // 100ns hop, 25GB/s, 32 credits
     auto* remote = controller_->add_remote_endpoint(node_id, peer_base_addr, peer_capacity, link_cfg);
     remote->tcp_transport_ = tcp_transport_.get();
-    remote->msg_manager_ = msg_manager_.get();
+    remote->msg_manager_ = msg_manager_ ? msg_manager_.get() : nullptr;
     remote->coherency_engine_ = controller_->coherency_.get();
 
     // Register in HDM decoder
@@ -1385,7 +1471,7 @@ int DistributedMemoryServer::forward_read_tcp(uint32_t target_node, uint64_t add
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_READ_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1442,7 +1528,7 @@ int DistributedMemoryServer::forward_write_tcp(uint32_t target_node, uint64_t ad
     dist_message_t req, resp;
     memset(&req, 0, sizeof(req));
     req.header.msg_type = DIST_MSG_WRITE_REQ;
-    req.header.msg_id = msg_manager_->generate_msg_id();
+    req.header.msg_id = generate_msg_id();
     req.header.src_node_id = node_id_;
     req.header.dst_node_id = target_node;
     req.header.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
