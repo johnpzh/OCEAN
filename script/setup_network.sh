@@ -1,6 +1,6 @@
 #!/bin/bash
 set -x
-set -e
+#set -e
 
 if [ $# != 1 ]; then
     echo "[ERROR] Wrong arguments number. Abort."

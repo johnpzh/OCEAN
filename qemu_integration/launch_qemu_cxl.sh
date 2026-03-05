@@ -31,4 +31,6 @@ $QEMU_BINARY \
     -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/dev/shm/cxlmemsim_shared,size=1G \
     -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/dev/shm/lsa1.raw,size=1G \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
+    -fsdev local,id=shared,path=/home/exouser/local,security_model=mapped \
+    -device virtio-9p-pci,fsdev=shared,mount_tag=hostshare,bus=pcie.0 \
     -nographic

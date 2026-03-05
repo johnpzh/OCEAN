@@ -9,7 +9,7 @@ DISK_IMAGE=${DISK_IMAGE:-plucky-server-cloudimg-amd64.img}
 
 # Enable SHM mode with lock-free coherency
 export CXL_TRANSPORT_MODE=shm
-export CXL_HOST_ID=1
+export CXL_HOST_ID=7
 $QEMU_BINARY \
     --enable-kvm -cpu qemu64,+xsave,+rdtscp,+avx,+avx2,+sse4.1,+sse4.2,+avx512f,+avx512dq,+avx512ifma,+avx512cd,+avx512bw,+avx512vl,+avx512vbmi,+clflushopt  \
     -m 16G,maxmem=32G,slots=8 \
@@ -17,9 +17,9 @@ $QEMU_BINARY \
     -M q35,cxl=on \
     -kernel ./bzImage \
     -append "root=/dev/sda rw console=ttyS0,115200 nokaslr" \
-    -drive file=./qemu1.img,index=0,media=disk,format=raw \
-    -netdev tap,id=net0,ifname=tap1,script=no,downscript=no \
-    -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:02 \
+    -drive file=./qemu7.img,index=0,media=disk,format=raw \
+    -netdev tap,id=net0,ifname=tap7,script=no,downscript=no \
+    -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:08 \
     -fsdev local,security_model=none,id=fsdev0,path=/dev/shm \
     -device virtio-9p-pci,id=fs0,fsdev=fsdev0,mount_tag=hostshm,bus=pcie.0 \
     -device pxb-cxl,bus_nr=12,bus=pcie.0,id=cxl.1 \
