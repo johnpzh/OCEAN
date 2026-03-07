@@ -29,8 +29,8 @@ cd temp
 wget https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3.tar.gz
 tar zxvf cmake-4.2.3.tar.gz 
 cd cmake-4.2.3/
-sudo ./bootstrap
-sudo make -j$(nproc)
+./bootstrap
+make -j$(nproc)
 sudo make install
 cmake --version
 cd ../..

@@ -34,8 +34,8 @@ $QEMU_BINARY \
     -device cxl-type3,bus=root_port13,persistent-memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-pmem0,sn=0x1 \
     -device cxl-type1,bus=root_port14,size=1G,cache-size=64M \
     -device virtio-cxl-accel-pci,bus=pcie.0 \
-    -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/dev/shm/cxlmemsim_dist_node0,size=4G \
-    -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/dev/shm/lsa0.raw,size=1G \
+    -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/dev/shm/cxlmemsim_dist_node0,size=256M \
+    -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/dev/shm/lsa0.raw,size=256K \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
     -fsdev local,id=shared,path=/home/exouser/local,security_model=mapped \
     -device virtio-9p-pci,fsdev=shared,mount_tag=hostshare,bus=pcie.0 \
